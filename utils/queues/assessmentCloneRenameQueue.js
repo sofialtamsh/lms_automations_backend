@@ -1,0 +1,85 @@
+import { Worker } from "bullmq";
+import { chromium } from "playwright";
+import dotenv from "dotenv";
+import { connection } from "../../configs/redis_bullmq.config.js";
+import { cloneAndEditAssessment } from "../cloneAndEditAssessment.js";
+
+
+dotenv.config();
+
+// 🧭 Create Worker
+const automationWorker = new Worker(
+  "assessmenCloneRenameQueue",
+  async (job) => {
+    const { assignments } = job.data;
+    if (!assignments || assignments.length === 0) {
+      console.log("⚠️ No assignments to process. Skipping job.");
+      return;
+    }
+
+    // 🧭 Launch browser once
+    const browser = await chromium.launch({ headless: false, slowMo: 100 });
+    const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+
+    try {
+      console.log("🔐 Logging into Assessment Platform...");
+      await page.goto(process.env.MASAI_ASSESS_PLATFORM_URL, { waitUntil: "networkidle" });
+      await page.fill('input[type="text"]', process.env.MASAI_ASSESS_PLATFORM_USER_EMAIL);
+      await page.fill('input[type="password"]', process.env.MASAI_ASSESS_PLATFORM_USER_PASSWORD);
+      await page.click('button[type="submit"]');
+      await page.waitForNavigation({ waitUntil: "networkidle" });
+      console.log("✅ Login successful");
+
+      // Select client once
+      const modal = page.locator('h2:has-text("Please select a client")').locator("..");
+      const dropdown = modal.locator("select.chakra-select");
+      await dropdown.first().waitFor({ state: "visible", timeout: 10000 });
+      await dropdown.first().selectOption({ label: "Masai LMS" });
+      //await dropdown.first().dispatchEvent("change");
+      await page.waitForSelector("text=Please select a client", { state: "detached" });
+      console.log("✅ Client selected: Masai LMS");
+
+      // Process all assignments sequentially
+      for (const a of assignments) {
+        if ((a.isCloned || "").toLowerCase() === "yes") {
+          console.log(`⏩ Skipping already cloned: ${a.assesment_template_name}`);
+          continue;
+        }
+
+        console.log(`🚀 Starting clone for: ${a.assesment_template_name}`);
+
+        const status = await cloneAndEditAssessment(
+          page,
+          a.previous_assessment_templateName,
+          a.assesment_template_name
+        );
+
+        // Optionally update Redis to track progress
+        const redisKey = `assignment:${a.assesment_template_name}`;
+        await connection.hset(redisKey, "isCloned", status === "Done" ? "yes" : "error");
+        await connection.hset(redisKey, "lastUpdated", new Date().toISOString());
+
+        console.log(`✅ ${a.assesment_template_name} → ${status}`);
+      }
+
+      console.log("🎯 All queued assessments processed successfully!");
+    } catch (err) {
+      console.error("❌ Worker runtime error:", err.message);
+    } finally {
+      await browser.close();
+      console.log("🪟 Browser closed.");
+    }
+  },
+  { connection }
+);
+
+// 🧠 Event logs
+automationWorker.on("completed", (job) =>
+  console.log(`✅ Job ${job.id} completed.`)
+);
+
+automationWorker.on("failed", (job, err) =>
+  console.error(`❌ Job ${job.id} failed: ${err.message}`)
+);
+
+console.log("🚀 Automation worker started and waiting for jobs...");

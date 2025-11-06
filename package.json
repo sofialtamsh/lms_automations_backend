@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "type": "module",
   "scripts": {
+    "server": "nodemon server.js",
+    "clone":"nodemon ./utils/queues/assessmentCloneRenameQueue.js",
+     "create":"nodemon ./utils/queues/assignmentCreationQueue.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -18,10 +22,15 @@
   },
   "homepage": "https://github.com/ABVenu/lms_automations_backend#readme",
   "dependencies": {
+    "bullmq": "^5.63.0",
+    "cors": "^2.8.5",
     "csv-parser": "^3.2.0",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "fs-extra": "^11.3.2",
+    "googleapis": "^164.1.0",
+    "ioredis": "^5.8.2",
+    "open": "^10.2.0",
     "playwright": "^1.56.1"
   }
 }
