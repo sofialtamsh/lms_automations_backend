@@ -4,6 +4,7 @@ import { chromium } from "playwright";
 import dotenv from "dotenv";
 import { connection } from "../../configs/redis_bullmq.config.js";
 import { cloneAndEditAssessment } from "../cloneAndEditAssessment.js";
+import { updateSheetCell } from "../updateSheet.js";
 
 
 dotenv.config();
@@ -63,8 +64,17 @@ const automationWorker = new Worker(
 
         // Optionally update Redis to track progress
         const redisKey = `assignments:${a.redisId}`;
-        await connection.hset(redisKey, "isCloned", status === "Done" ? "yes" : "no");
+        const isClonedValue = status === "Done" ? "yes" : "no";
+        await connection.hset(redisKey, "isCloned", isClonedValue);
         await connection.hset(redisKey, "lastUpdated", new Date().toISOString());
+        // Update Sheet
+        await updateSheetCell(
+          process.env.GOOGLE_SHEET_ID,
+          "assignment",
+          a.redisId,
+          "isCloned",
+          isClonedValue
+        );
 
         console.log(`✅ ${a.assessment_template_name} → ${status}`);
       }

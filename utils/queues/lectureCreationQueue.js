@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { connection } from "../../configs/redis_bullmq.config.js";
 import { createLecture } from "../createLecture.js";
 import { decrypt } from "../crypto.js";
+import { updateSheetCell } from "../updateSheet.js";
 
 dotenv.config();
 console.log("This Queue is Running for Lecture Creation ✅");
@@ -49,10 +50,24 @@ const lectureWorker = new Worker(
         const redisKey = `lectures:${lec.redisId}`;
         const status = await createLecture(page,lec);
         console.log("🚀 ~ from the lecture creation queue status:", status)
+        const isLectureCreatedValue = status === "Done" ? "yes" : "no";
+        console.log("🚀 ~ isLectureCreatedValue:", isLectureCreatedValue)
         await connection.hset(redisKey, {
-          isNotesUpdated: status==="Done" ? "true" : "false",
+          isNotesUpdated: isLectureCreatedValue,
+          isLectureCreated:isLectureCreatedValue,
           lastUpdated: new Date().toISOString(),
         });
+        // Update Sheet
+        await updateSheetCell(
+          process.env.GOOGLE_SHEET_ID,
+          "lecture",
+          lec.redisId,
+          "isLectureCreated",
+          isLectureCreatedValue
+        );
+
+        console.log(`✅ ${lec.title} → ${status}`);
+
       }
 
       console.log("🎯 All queued lectures processed successfully!");

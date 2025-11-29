@@ -3,18 +3,47 @@ import dotenv from "dotenv";
 import { v4 as uuidv4 } from "uuid";
 import { getSheetsClient } from "../configs/googleSheetClient.js";
 import { assessmentCloneRenameQueue, assignmentCreationQueue, connection, notesUpdationQueue, lectureCreationQueue} from "../configs/redis_bullmq.config.js";
-import { batch } from "googleapis/build/src/apis/batch/index.js";
 dotenv.config();
 
 export const AutomationRouter = express.Router();
 
-// only read the data from google sheet and add that into the Redis only
-AutomationRouter.post("/add-assignment-data", async (req, res) => {
+AutomationRouter.post("/add-data", async (req, res) => {
   try {
+    const type = req.query.type; // assignments or lectures
+    if (!type) {
+      return res.status(400).json({ message: "Missing ?type=assignments|lectures" });
+    }
+
+    const validTypes = ["assignments", "lectures"];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({
+        message: "Invalid type. Use assignments or lectures."
+      });
+    }
+
+    const sheetName = type === "assignments" ? "assignment" : "lecture";
+
+    console.log(`📄 Reading sheet: ${sheetName}`);
+
     const sheets = getSheetsClient();
     const spreadsheetId = process.env.GOOGLE_SHEET_ID;
-    console.log("🚀 ~ spreadsheetId:", spreadsheetId)
-    const range = "Sheet1!A:Z";
+
+    // --- FETCH SHEET METADATA TO GET sheetId ---
+    const meta = await sheets.spreadsheets.get({ spreadsheetId });
+    const targetSheet = meta.data.sheets.find(
+      (s) => s.properties.title === sheetName
+    );
+    console.log("🚀 ~ targetSheet:", targetSheet)
+
+    if (!targetSheet) {
+      return res.status(400).json({ message: `Sheet '${sheetName}' not found.` });
+    }
+
+    const sheetId = targetSheet.properties.sheetId;
+    console.log("📌 sheetId:", sheetId);
+
+    // --- READ DATA ---
+    const range = `${sheetName}!A:Z`;
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId,
@@ -23,45 +52,114 @@ AutomationRouter.post("/add-assignment-data", async (req, res) => {
 
     const rows = response.data.values;
     if (!rows || rows.length === 0) {
-      return res.status(400).json({ message: "No data found in sheet" });
+      return res.status(400).json({ message: `No data found in ${sheetName}` });
     }
 
     const headers = rows[0];
+    const redisIdColIndex = headers.indexOf("redisId");
+
+    console.log("🚀 ~ redisIdColIndex:", redisIdColIndex);
+
+    if (redisIdColIndex === -1) {
+      return res.status(400).json({
+        message: `Column "redisId" not found in sheet ${sheetName}`,
+      });
+    }
+
     const records = rows.slice(1).map((row) => {
       const obj = {};
       headers.forEach((h, i) => (obj[h] = row[i] || ""));
       return obj;
     });
-    console.log("🚀 ~ records:", records)
 
+    console.log("📌 Records fetched:", records.length);
+
+    // --- DELETE OLD REDIS DATA ---
+    const pattern = `${type}:*`;
+    const oldKeys = await connection.keys(pattern);
+    console.log("🚀 ~ oldKeys:", oldKeys)
+
+    if (oldKeys.length > 0) {
+      await connection.del(...oldKeys);
+      console.log(`🗑️ Old ${type} removed:`, oldKeys.length);
+    }
+
+    // --- INSERT NEW DATA & PREPARE WRITE-BACK REQUESTS ---
     let success = 0,
       failed = 0;
-    
-    for (const rec of records) {
-      const redisId= rec.lecture_id ? rec.lecture_id : rec.title.replace(/\s+/g, "-").toLowerCase() + "-" + uuidv4();
-      rec.redisId=redisId
-      console.log("🚀 ~ redisKey:", redisId)
-      
+
+    const writeBackRequests = [];
+
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+
+      const redisId = rec.lecture_id
+        ? rec.lecture_id
+        : rec.title?.replace(/\s+/g, "-").toLowerCase() + "-" + uuidv4();
+
+      rec.redisId = redisId;
+
       try {
-        const redisKey = `assignments:${redisId}`;
+        const redisKey = `${type}:${redisId}`;
         await connection.hset(redisKey, rec);
         success++;
+
+        // Batch update request
+        writeBackRequests.push({
+          updateCells: {
+            rows: [
+              {
+                values: [
+                  {
+                    userEnteredValue: { stringValue: redisId }
+                  }
+                ]
+              }
+            ],
+            fields: "userEnteredValue",
+            range: {
+              sheetId,
+              startRowIndex: i + 1,
+              endRowIndex: i + 2,
+              startColumnIndex: redisIdColIndex,
+              endColumnIndex: redisIdColIndex + 1
+            }
+          }
+        });
+
       } catch (err) {
-        console.error("❌ Redis insert error:", redisId, err.message);
+        console.error("❌ Redis insert error:", err.message);
         failed++;
       }
     }
 
+    // --- EXECUTE BATCH UPDATE IN SHEET ---
+    if (writeBackRequests.length > 0) {
+      try {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            requests: writeBackRequests
+          }
+        });
+
+        console.log("🟢 redisId write-back completed");
+      } catch (err) {
+        console.error("⚠️ Write-back failed:", err.message);
+      }
+    }
+
     return res.json({
-      message: "✅ Assignment data loaded into Redis successfully.",
+      message: `✅ ${type.charAt(0).toUpperCase() + type.slice(1)} uploaded successfully.`,
       totalSheetRows: records.length,
-      insertedToRedis: success,
-      failedRedisInsert: failed,
+      redisInserted: success,
+      redisFailed: failed,
     });
+
   } catch (err) {
-    console.error("❌ Error reading sheet:", err.message);
+    console.error("❌ Error:", err.message);
     return res.status(500).json({
-      message: "Server error while uploading assignment data.",
+      message: "Server error.",
       error: err.message,
     });
   }
@@ -69,76 +167,56 @@ AutomationRouter.post("/add-assignment-data", async (req, res) => {
 
 AutomationRouter.post("/create-lectures", async (req, res) => {
   try {
-    const sheets = getSheetsClient();
-    const spreadsheetId = process.env.GOOGLE_SHEET_ID;
-    const range = "lecture!A:Z";
-
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range,
-    });
-
-    const rows = response.data.values;
-    if (!rows || rows.length === 0) {
-      return res.status(400).json({ message: "No data found in sheet" });
-    }
-
-    const headers = rows[0];
-    const records = rows.slice(1).map((row) => {
-      const obj = {};
-      headers.forEach((h, i) => (obj[h] = row[i] || ""));
-      return obj;
-    });
-    console.log("🚀 ~ records:", records)
-
-    let success = 0,
-      failed = 0;
-
-    for (const rec of records) {
-      const redisId = rec.title.replace(/\s+/g, "-").toLowerCase() + "-" + uuidv4();
-      rec.redisId = redisId;
-      console.log("🚀 ~ redisKey:", redisId)
-      
-      try {
-        const redisKey = `lectures:${redisId}`;
-        await connection.hset(redisKey, rec);
-        success++;
-      } catch (err) {
-        console.error("❌ Redis insert error:", redisId, err.message);
-        failed++;
-      }
-    }
-    // Step 2️⃣ — Fetch from Redis (after insertion)
+    // 🔹 1 — Fetch all lecture data from Redis
     const keys = await connection.keys("lectures:*");
     const allLectures = [];
 
     for (const key of keys) {
       const data = await connection.hgetall(key);
-      if (data && Object.keys(data).length > 0) allLectures.push(data);
+      if (data && Object.keys(data).length > 0) {
+        allLectures.push(data);
+      }
     }
 
-    // Step 3 — Queue the job
+    // 🔸 If Redis is empty
+    if (allLectures.length === 0) {
+      return res.status(404).json({ message: "No lecture data found in Redis." });
+    }
+
+    // 🔹 2 — Filter only pending lectures
+    // Expecting field: isCreated = "no"
+    const pendingLectures = allLectures.filter(
+      (l) => (l.isLectureCreated || "").toLowerCase() === "no"
+    );
+
+    // 🔸 If nothing is pending
+    if (pendingLectures.length === 0) {
+      return res.status(200).json({
+        message: "✅ All lectures have already been created.",
+      });
+    }
+
+    // 🔹 3 — Queue the job ONLY for pending
     const job = await lectureCreationQueue.add("bulkLectureCreateJob", {
-      lectures: allLectures,
+      lectures: pendingLectures,
     });
 
-    // Step 4 — Final response
+    // 🔹 4 — Send result
     return res.json({
-      message: "✅ Lecture data loaded & creation job queued successfully.",
-      totalSheetRows: records.length,
-      insertedToRedis: success,
-      failedRedisInsert: failed,
-      queuedLectures: allLectures.length,
+      message: "✅ Lecture creation job queued successfully.",
+      queuedLectures: pendingLectures.length,
       jobId: job.id,
     });
+
   } catch (err) {
-    console.error("❌ Error reading sheet:", err.message);
+    console.error("❌ Error while queuing lecture create job:", err.message);
     return res.status(500).json({
-      message: "Server error while uploading assignment data.",
+      message: "Server error while queuing lecture creation job.",
       error: err.message,
     });
   }
 });
+
 
 AutomationRouter.post("/clone-assessment-template", async (req, res) => {
   try {
@@ -188,94 +266,91 @@ AutomationRouter.post("/clone-assessment-template", async (req, res) => {
 
 AutomationRouter.post("/create-assignments", async (req, res) => {
   try {
-    // Step 1️⃣ — Get all assignment data from Redis
     const keys = await connection.keys("assignments:*");
-    const allAssignments = [];
-
+    const pendingAssignments = [];
+    
     for (const key of keys) {
-      const data = await connection.hgetall(key);
-      if (data && Object.keys(data).length > 0) {
-        allAssignments.push(data);
+      const a = await connection.hgetall(key);
+
+      if (!a || Object.keys(a).length === 0) continue;
+
+      // STEP 1: Early check — stop at first not cloned
+      if (!a.isCloned || a.isCloned.toLowerCase() !== "yes") {
+        return res.status(400).json({
+          message:
+            "❌ Some assignments are not cloned yet. Please clone ALL assessments before creating assignments.",
+          details: a,
+        });
+      }
+
+      // STEP 2: Collect only pending ones
+      if (!a.isAssignmentCreated || a.isAssignmentCreated.toLowerCase() !== "yes") {
+        pendingAssignments.push(a);
       }
     }
-    
-    // console.log("🚀 ~ allAssignments:", allAssignments)
-    if (allAssignments.length === 0) {
-      return res.status(404).json({ message: "No assignments found in Redis" });
-    }
 
-    // Step 2️⃣ — Filter only cloned ones that are not yet created
-    const pendingAssignments = allAssignments.filter(
-      (a) =>
-        a.isCloned &&
-        a.isCloned.toLowerCase() === "yes" &&
-        (!a.isAssignmentCreated ||
-          a.isAssignmentCreated.toLowerCase() !== "true")
-    );
-    console.log("all pending assignments are here ==>", pendingAssignments)
     if (pendingAssignments.length === 0) {
       return res.status(200).json({
-        message: "All cloned assignments already have been created.",
+        message: "All assignments already created.",
       });
     }
-    console.log("📚 these are the pending assignments =>",pendingAssignments)
-    // Step 3️⃣ — Add one job for all pending assignments
+    console.log("🔷 pending Assignments length and the assignments====>", pendingAssignments.length, pendingAssignments)
     const job = await assignmentCreationQueue.add("bulkAssignmentCreateJob", {
       assignments: pendingAssignments,
     });
 
     return res.json({
-      message: "✅ Assignment creation job queued successfully.",
-      queuedAssignments: pendingAssignments.length,
+      message: "Queued successfully",
+      pendingCount: pendingAssignments.length,
       jobId: job.id,
     });
+
   } catch (err) {
-    console.error("❌ Error while queuing assignment creation:", err.message);
     return res.status(500).json({
-      message: "Server error while adding assignment creation job",
+      message: "Server error",
       error: err.message,
     });
   }
 });
 
 
-
-
 AutomationRouter.post("/start-update-notes", async (req, res) => {
   try {
-    // Step 1️⃣ — Get all assignment data from Redis
+    // Step 1 — Get all assignment data from Redis
     const keys = await connection.keys("assignments:*");
-    const allLectures = [];
-
-    for (const key of keys) {
-      const data = await connection.hgetall(key);
-      if (data && Object.keys(data).length > 0) {
-        allLectures.push(data);
-      }
-    }
-
-    if (allLectures.length === 0) {
+    
+    if (keys.length === 0) {
       return res.status(404).json({ message: "No assignments found in Redis" });
     }
 
-    // Step 2️⃣ — Filter only those whose notes are not updated yet
-    const pendingNotesToUpdate = allLectures.filter(
-      (a) =>
-        !a.isNotesUpdated ||
-        (a.isNotesUpdated && a.isNotesUpdated.toLowerCase() !== "true")
-    );
+    const pendingNotesToUpdate = [];
 
-    console.log("Pending notes to update:", pendingNotesToUpdate.length);
+    // Step 2 — One-pass loop
+    for (const key of keys) {
+      const data = await connection.hgetall(key);
+      if (!data || Object.keys(data).length === 0) continue;
 
+      // If notes are already updated → skip
+      if (data.isNotesUpdated && data.isNotesUpdated.toLowerCase() === "yes") {
+        continue;
+      }
+
+      // Otherwise pending
+      pendingNotesToUpdate.push(data);
+    }
+
+    console.log("Pending notes to update:", pendingNotesToUpdate.length, pendingNotesToUpdate);
+
+    // Step 3 — Nothing pending
     if (pendingNotesToUpdate.length === 0) {
       return res.status(200).json({
-        message: "✅ All Lectures already have updated notes.",
+        message: "✅ All lectures already have updated notes.",
       });
     }
 
-    // Step 3️⃣ — Add one job for all pending notes
+    // Step 4 — Queue job
     const job = await notesUpdationQueue.add("bulkNotesUpdateJob", {
-      lectures: pendingNotesToUpdate, // still calling them 'lectures' for compatibility
+      lectures: pendingNotesToUpdate,
     });
 
     return res.json({
@@ -283,6 +358,7 @@ AutomationRouter.post("/start-update-notes", async (req, res) => {
       queuedLectures: pendingNotesToUpdate.length,
       jobId: job.id,
     });
+
   } catch (err) {
     console.error("❌ Error while queuing notes update:", err.message);
     return res.status(500).json({
@@ -292,34 +368,77 @@ AutomationRouter.post("/start-update-notes", async (req, res) => {
   }
 });
 
-// ✅ GET all assignment data summaries
+
 AutomationRouter.get("/get-automation-status", async (req, res) => {
   try {
-    const keys = await connection.keys("assignments:*");
+    const type = req.query.type; // assignments OR lectures
+    console.log("🚀 ~ type: ======>", type);
+
+    // --- VALIDATE TYPE ---
+    if (!type) {
+      return res.status(400).json({
+        message: "Missing ?type=assignments|lectures",
+      });
+    }
+
+    const validTypes = ["assignments", "lectures"];
+    if (!validTypes.includes(type)) {
+      return res.status(400).json({
+        message: "Invalid type. Use ?type=assignments OR ?type=lectures",
+      });
+    }
+
+    // --- REDIS KEY PATTERN ---
+    const pattern = `${type}:*`; // assignments:* or lectures:*
+    const keys = await connection.keys(pattern);
 
     if (keys.length === 0) {
-      return res.status(404).json({ message: "No assignment data found in Redis." });
+      return res.status(404).json({
+        message: `No ${type} data found in Redis.`,
+      });
     }
 
-    const allAssignments = [];
+    const results = [];
+
     for (const key of keys) {
       const data = await connection.hgetall(key);
+
       if (data && Object.keys(data).length > 0) {
-        allAssignments.push({
-          title: data.title || key.replace("assignment:", ""),
-          batch:data.batch,
-          section:data.section,
-          isCloned: data.isCloned || "N/A",
-          isAssignmentCreated: data.isAssignmentCreated || "N/A",
-          isNotesUpdated: data.isNotesUpdated || "N/A",
-        });
+
+        // REMOVE PREFIX like "assignments:" or "lectures:"
+        const cleanKey = key.replace(`${type}:`, "");
+        // COMMON FIELDS
+        const commonData = {
+          redisKey: cleanKey,
+          title: data.title || "",
+          batch: data.batch || "",
+          section: data.section || "",
+        };
+
+        // DIFFERENT LOGIC FOR ASSIGNMENTS VS LECTURES
+        if (type === "assignments") {
+          results.push({
+            ...commonData,
+            isCloned: data.isCloned || "N/A",
+            isAssignmentCreated: data.isAssignmentCreated || "N/A",
+            isNotesUpdated: data.isNotesUpdated || "N/A",
+          });
+        }
+
+        if (type === "lectures") {
+          results.push({
+            ...commonData,
+            isLectureCreated: data.isLectureCreated || "N/A",
+          });
+        }
       }
     }
-
     return res.json({
-      total: allAssignments.length,
-      assignments: allAssignments,
+      type,
+      total: results.length,
+      data: results,
     });
+
   } catch (err) {
     console.error("❌ Error fetching automation status:", err.message);
     return res.status(500).json({
@@ -331,90 +450,245 @@ AutomationRouter.get("/get-automation-status", async (req, res) => {
 
 AutomationRouter.patch("/update-automation-status", async (req, res) => {
   try {
-    const { title, field, newValue } = req.body;
+    const { redisId, field, newValue } = req.body;
+    console.log("🚀 ~ redisId:", redisId)
+    const type = req.query.type;
+    console.log("🚀 ~ type:", type)
 
-    if (!title || !field || typeof newValue === "undefined") {
+    if (!type) {
+      return res.status(400).json({ message: "Missing ?type=assignments|lectures" });
+    }
+
+    if (!redisId || !field || typeof newValue === "undefined") {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
-    // Find the Redis key
-    const redisKey = `assignments:${redisId}`;
+    const redisKey = type==="assignments" ? `assignments:${redisId}`:`lectures:${redisId}`
+    console.log("🚀 ~ redisKey:", redisKey)
 
-    // Check if key exists
+    // Check Redis existence
     const exists = await connection.exists(redisKey);
+    console.log("🚀 ~ exists:", exists)
     if (!exists) {
-      return res.status(404).json({ message: `No record found for ${title}` });
+      return res.status(404).json({ message: `No record found: ${redisKey}` });
     }
 
-    // Normalize the field names between frontend & Redis
-    let redisField;
-    switch (field) {
-      case "assessmentClone":
-        redisField = "isCloned";
-        break;
-      case "assignmentCreated":
-        redisField = "isAssignmentCreated";
-        break;
-      case "notesUpdated":
-        redisField = "isNotesUpdated";
-        break;
-      default:
-        return res.status(400).json({ message: "Invalid field name" });
+    // ---------- FIELD MAPPING ----------
+    let redisField, sheetField;
+
+    if (type === "assignments") {
+      switch (field) {
+        case "assessmentClone":
+          redisField = "isCloned";
+          sheetField = "isCloned";
+          break;
+        case "assignmentCreated":
+          redisField = "isAssignmentCreated";
+          sheetField = "isAssignmentCreated";
+          break;
+        case "notesUpdated":
+          redisField = "isNotesUpdated";
+          sheetField = "isNotesUpdated";
+          break;
+        default:
+          return res.status(400).json({ message: "Invalid field for assignments" });
+      }
     }
 
-    // Update the field in Redis
+    if (type === "lectures") {
+      switch (field) {
+        case "lectureCreated":
+          redisField = "isLectureCreated";
+          sheetField = "isLectureCreated";
+          break;
+        default:
+          return res.status(400).json({ message: "Invalid field for lectures" });
+      }
+    }
+
+    // ---------- UPDATE REDIS ----------
     await connection.hset(redisKey, redisField, newValue);
 
-    return res.json({
-      message: `✅ ${redisField} updated successfully for ${title}`,
-      updatedField: redisField,
-      newValue,
+    // ---------- UPDATE GOOGLE SHEET ----------
+    const sheets = getSheetsClient();
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+
+    const sheetName = type === "assignments" ? "assignment" : "lecture";
+    const range = `${sheetName}!A:Z`;
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
     });
+
+    const rows = response.data.values;
+    const headers = rows[0];
+
+    const colIndex = headers.indexOf(sheetField);
+    console.log("🚀 ~ colIndex:", colIndex)
+    if (colIndex === -1) {
+      return res.status(400).json({ message: "Column not found in sheet" });
+    }
+
+    // find row by redisId
+    const rowIndex = rows.findIndex((row) => row.includes(redisId));
+    console.log("🚀 ~ rowIndex:", rowIndex)
+    if (rowIndex === -1) {
+      return res.status(404).json({ message: "Row not found in sheet" });
+    }
+
+    const updateRange = `${sheetName}!${String.fromCharCode(65 + colIndex)}${rowIndex + 1}`;
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: updateRange,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [[newValue]],
+      },
+    });
+
+    return res.json({
+      message: `✅ Updated Redis and Google Sheet successfully`,
+      field: redisField,
+      newValue,
+      redisKey
+    });
+
   } catch (err) {
     console.error("❌ Error updating automation status:", err.message);
     return res.status(500).json({
       message: "Server error while updating automation status",
-      error: err.message,
+      error: err.message
     });
   }
 });
 
-
 // ✅ Clear all Redis data related to automation
 AutomationRouter.delete("/cleardata", async (req, res) => {
   try {
-    // Delete all assignment keys
-    const assignmentKeys = await connection.keys("assignments:*");
-    if (assignmentKeys.length > 0) {
-      await connection.del(assignmentKeys);
-      console.log(`🧹 Deleted ${assignmentKeys.length} assignment keys`);
+    const type = req.query.type; // assignments | lectures
+    console.log("🚀 ~ type:", type);
+
+    if (!type || !["assignments", "lectures"].includes(type)) {
+      return res.status(400).json({
+        message: "Invalid type. Allowed: assignments | lectures",
+      });
     }
 
-    // Clear all queues (BullMQ keys)
-    const queuesToClear = [
+    // ------------------------------------------
+    // 🔥 1) CLEAR Google Sheet redisId Column
+    // ------------------------------------------
+    const sheets = getSheetsClient();
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID;
+
+    const sheetName = type === "assignments" ? "assignment" : "lecture";
+    const range = `${sheetName}!A:Z`;
+
+    // Step 1: Read sheet
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
+    });
+
+    const rows = response.data.values || [];
+    if (rows.length === 0) {
+      return res.status(400).json({
+        message: `❌ Sheet '${sheetName}' is empty.`,
+      });
+    }
+
+    // Step 2: Detect redisId column dynamically
+    const headers = rows[0];
+    const redisColIndex = headers.findIndex(
+      (h) => h?.toLowerCase().trim() === "redisid"
+    );
+    console.log("🚀 ~ redisColIndex:", redisColIndex)
+    // console.log("🚀 ~ headers:", headers)
+
+    if (redisColIndex === -1) {
+      return res.status(400).json({
+        message: `❌ 'redisId' column not found in sheet '${sheetName}'. Please check header.`,
+        availableHeaders: headers,
+      });
+    }
+
+    // Convert index → column letter (A–Z)
+    const colLetter = String.fromCharCode(65 + redisColIndex);
+    const clearRange = `${sheetName}!${colLetter}2:${colLetter}`;
+    console.log("🚀 ~ clearRange:", clearRange)
+
+    // Step 3: Clear entire redisId column dynamically
+    const totalRows = rows.length; // including header row
+    const blankValues = [];
+      
+    // Create empty rows equal to sheet rows-1 (excluding header)
+    for (let i = 1; i < totalRows; i++) {
+      blankValues.push([""]);
+    }
+    
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: clearRange,
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: blankValues,
+      },
+    });
+
+    console.log(`🧽 Cleared redisId column (${colLetter}) in sheet '${sheetName}'`);
+
+    // ------------------------------------------
+    // 🔥 2) CLEAR REDIS KEYS
+    // ------------------------------------------
+    const redisPattern = `${type}:*`;
+    const keys = await connection.keys(redisPattern);
+    let clearedCount = 0;
+
+    if (keys.length > 0) {
+      await connection.del(keys);
+      clearedCount = keys.length;
+      console.log(`🧹 Deleted ${keys.length} Redis keys for type: ${type}`);
+    }
+
+    // ------------------------------------------
+    // 🔥 3) CLEAR BullMQ QUEUES BASED ON TYPE
+    // ------------------------------------------
+    const assignmentQueues = [
       "assessmentCloneRenameQueue",
       "assignmentCreationQueue",
       "notesUpdationQueue",
-      "lectureCreationQueue"
     ];
+
+    const lectureQueues = ["lectureCreationQueue"];
+
+    const queuesToClear =
+      type === "assignments" ? assignmentQueues : lectureQueues;
 
     for (const q of queuesToClear) {
       const pattern = `bull:${q}:*`;
       const queueKeys = await connection.keys(pattern);
+
       if (queueKeys.length > 0) {
         await connection.del(queueKeys);
-        console.log(`🧼 Cleared queue data for ${q}`);
+        console.log(`🧼 Cleared BullMQ queue: ${q}`);
       }
     }
 
+    // ------------------------------------------
+    // 🔥 4) FINAL RESPONSE
+    // ------------------------------------------
     return res.json({
-      message: "🧹 All assignment and queue data cleared successfully.",
-      clearedAssignments: assignmentKeys.length,
+      message: `🧹 Cleared Redis + queues + redisId column for '${type}'.`,
+      clearedRedisIdColumn: colLetter,
+      sheetName,
+      clearedRedisKeys: clearedCount,
     });
+
   } catch (err) {
-    console.error("❌ Error clearing Redis data:", err.message);
+    console.error("❌ Error clearing data:", err);
     return res.status(500).json({
-      message: "Server error while clearing Redis data",
+      message: "Server error while clearing data",
       error: err.message,
     });
   }

@@ -3,7 +3,7 @@ export async function createLecture(page, lecture) {
     console.log(
       `🚀 Creating lecture: ${lecture.title}`
     );
-    let flagForLecture=false
+    // let flagForLecture=false
     // 1️⃣ Go to lectures page
     await page.goto("https://experience-admin.masaischool.com/lectures/create/", {
       waitUntil: "domcontentloaded",
@@ -160,7 +160,7 @@ export async function createLecture(page, lecture) {
       await page.waitForTimeout(1000); 
       await page.keyboard.press("Enter");
       console.log("🗒️ Notes updated successfully");
-      flagForLecture=true
+      // flagForLecture=true
     } catch (err) {
       console.log(`⚠️ Could not update notes: ${err.message}`);
     }
@@ -207,20 +207,18 @@ export async function createLecture(page, lecture) {
     await page.keyboard.type(lecture.endTime, { delay: 30 });
     
     await page.waitForTimeout(1500); 
-    // Step 4️⃣ Confirm
-    await page.keyboard.press("Enter");
-
     console.log(`✅ Schedule will end at: ${lecture.endDate} ${lecture.endTime}`);
 
 
     // Click on the Create Button
+    console.log("📚 now it will hit the create button")
     const createButton = page.locator('button:has-text("CREATE")');
-    await createButton.waitFor({ state: "visible", timeout: 10000 });
-    await page.waitForTimeout(1500); 
-    await createButton.click({force:true});
-    console.log(`✏️ Filled notes successfully`);
-    
-    return flagForLecture ? "Done" : "Not Done"
+    await createButton.waitFor({ state: "visible", timeout: 3000 });
+    await page.waitForTimeout(500); 
+    console.log({createButton}, "this is the create button")
+    await createButton.click();
+    console.log("button hitttttt!!!!!!!!!!!!!!!!!!!")
+    return "Done"
   } catch (err) {
     console.error(
       `❌ Error while creating lecture '${lecture.title}':`,

@@ -80,12 +80,6 @@ export async function createAssignment(page, assignment) {
     await page.keyboard.press("Enter");
     console.log(`✅ Selected client: ${assignment.assess_client}`);
 
-    /// click template input
-    /// click an input whose placeholer is Enter Assessment Template
-    /// then a modal popsup, wait for that
-    // then search for an input tag, whose place holder is Search by title that assessment.title, wait all the result loads i table
-    // then click the first td which is checkbox
-
     //  🧩 Select Assessment Template (Modal Flow)
     const templateInput = page.locator(
       'input[placeholder="Enter Assessment Template"]'
@@ -96,10 +90,7 @@ export async function createAssignment(page, assignment) {
       "🖱️ Clicked 'Enter Assessment Template' input — modal should open"
     );
     await page.waitForTimeout(1000);
-    // // Wait for the modal to appear
-    // await page.waitForSelector('div[role="dialog"]', { timeout: 10000 });
-    // console.log("🪟 Assessment template modal appeared");
-
+    
     // Find and type into the search input inside the modal
     const modalSearchInput = page.locator(
       'input[placeholder="Search by title"]'
@@ -121,7 +112,7 @@ export async function createAssignment(page, assignment) {
     await page.waitForTimeout(1000);
     await firstCheckbox.click({ force: true });
     console.log(
-      `✅ Selected first assessment result for: ${assignment.assesment_template_name}`
+      `✅ Selected first assessment result for: ${assignment.title}`
     );
 
     // Wait for modal to close
@@ -160,10 +151,10 @@ export async function createAssignment(page, assignment) {
     );
     await associatedLecturesInput.waitFor({ state: "visible", timeout: 10000 });
     await associatedLecturesInput.click({ force: true }); // focus field
-    await page.keyboard.type(assignment.title, { delay: 30 });
+    await page.keyboard.type(assignment.associated_lecture, { delay: 30 });
     await page.waitForTimeout(1000); 
     await page.keyboard.press("Enter");
-    console.log(`✅ Selected associated lectures: ${assignment.title}`);
+    console.log(`✅ Selected associated lectures: ${assignment.associated_lecture}`);
 
     //// Group Type
     const groupTypeInput = page.locator(
@@ -242,8 +233,14 @@ export async function createAssignment(page, assignment) {
     // Step 3️⃣ Type the time (e.g. "08:00 PM")
     await page.keyboard.type(assignment.endTime, { delay: 30 });
 
-    // Step 4️⃣ Confirm
-    await page.keyboard.press("Enter");
+    console.log("📚 now it will hit the create button")
+    const createButton = page.locator("xpath=/html/body/div/div/div/main/form/div[1]/div/button");
+    await createButton.scrollIntoViewIfNeeded();
+    await createButton.waitFor({ state: "visible", timeout: 3000 });
+    await page.waitForTimeout(500); 
+    console.log({createButton}, "this is the create button")
+    await createButton.click();
+    console.log("button hitttttt!!!!!!!!!!!!!!!!!!!")
 
     console.log(`✅ Schedule will end at: ${assignment.endDate} ${assignment.endTime}`);
     return "Done";

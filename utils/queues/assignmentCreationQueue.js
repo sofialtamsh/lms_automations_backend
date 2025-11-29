@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { connection } from "../../configs/redis_bullmq.config.js";
 import { createAssignment } from "../createAssignment.js";
 import { decrypt } from "../crypto.js";
+import { updateSheetCell } from "../updateSheet.js";
 
 dotenv.config();
 console.log("This Queue is Running for Assignment Creation ✅");
@@ -49,13 +50,24 @@ const assignmentWorker = new Worker(
       for(const a of assignments){
         const redisKey = `assignments:${a.redisId}`;
         const status = await createAssignment(page, a);
-
+        const isAssignmentCreatedValue = status === "Done" ? "yes" : "no";
         await connection.hset(redisKey, {
-          isAssignmentCreated: status === "Done" ? "true" : "false",
+          isAssignmentCreated: isAssignmentCreatedValue,
           assignmentCreationError: status === "Error" ? "Creation failed" : "",
           lastUpdated: new Date().toISOString(),
         });
+        // Update Sheet
+        await updateSheetCell(
+          process.env.GOOGLE_SHEET_ID,
+          "assignment",
+          a.redisId,
+          "isAssignmentCreated",
+          isAssignmentCreatedValue
+        );
+
+        console.log(`✅ ${a.title} → ${status}`);
       }
+      
 
       console.log("🎯 All queued assignments processed successfully!");
     } catch (err) {

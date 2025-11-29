@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { connection } from "../../configs/redis_bullmq.config.js";
 import { updateNotes } from "../notesUpdation.js";
 import { decrypt } from "../crypto.js";
+import { updateSheetCell } from "../updateSheet.js";
 
 dotenv.config();
 console.log("This Queue is Running for Notes Updation ✅");
@@ -54,15 +55,23 @@ const notesUpdationWorker = new Worker(
 
         const status = await updateNotes(page, lec);
         console.log(`📋 updateNotes returned: ${status}`);
-
+        const isNotesUpdatedValue=status === "Done" ? "yes" : "no"
         await connection.hset(redisKey, {
-          isNotesUpdated: status === "Done" ? "true" : "false",
+          isNotesUpdated: isNotesUpdatedValue,
           isNotesUpdatedError: status === "Error" ? "Failed To Update" : "",
           lastUpdated: new Date().toISOString(),
         });
-        console.log(
-          `📦 Redis updated for assignment: ${lec.title}`
+
+        // Update Sheet
+        await updateSheetCell(
+          process.env.GOOGLE_SHEET_ID,
+          "assignment",
+          lec.redisId,
+          "isNotesUpdated",
+          isNotesUpdatedValue
         );
+      
+        console.log(`✅ ${lec.title} → ${status}`);
        
       }
 
